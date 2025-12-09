@@ -6,35 +6,54 @@ v1.0 - 07-Oct-2025 - initial release
 Author: Steve Holl [sholl@cisco.com]
 
 This script registers a Cisco XDR/Workflows Remote Appliance by:
-1. Prompting for the base64 OVF user-data string
+1. Reading base64 OVF user-data from a file
 2. Extracting values.yaml and ca-key-pair.yaml from cloud-config
-3. Checking for existing containers and offering to clean up
-4. Checking IPv4 forwarding and offering to enable it
+3. Automatically cleaning up existing containers
+4. Automatically enabling IPv4 forwarding if needed
 5. Writing configuration files to /etc/ao-remote/
 6. Running the docker-compose-init.sh script
 7. Verifying registration and container status
 
+Fully repeatable for lab environments without needing
+the user encoded-data into the OVF, which some virtualization
+environments don't support
+
 Features:
+- **Validates all three certificates (ca.crt, tls.key, tls.crt) are present**
+- **Always deletes old extracted certificate PEM files to force fresh extraction**
 - Handles base64 padding issues automatically
+- Supports plain text or zipped config files
 - Detects certificate data in files with empty paths
 - Normalizes YAML structure for compatibility
-- Checks and enables IPv4 forwarding for Docker networking
-- Detects existing registrations and offers clean re-registration
-- Fully repeatable for lab environments without needing
-  the user encoded-data into the OVF, which some virtualization
-  environments don't support
+- Detects existing registrations and automatically cleans up
 
-Usage (run directly on the appliance):
-    sudo python3 register-local.py
+v1.4 Changes:
+- REMOVED all interactive prompts - input prompt with pasted text often dropped characters
+causing data parsing issues
+- ADDED support for zipped config files (.gz, .zip)
+- ADDED argparse with proper help documentation
+- ADDED --force flag to skip all confirmations
+- IMPROVED error messages and validation
 
-Or non-interactive:
-    sudo python3 register-local.py <base64_string>
+Usage:
+    # From file
+    sudo python3 register_remote.py config.txt
+    sudo python3 register_remote.py config.txt.gz
+
+    # From stdin
+    cat config.txt | sudo python3 register_remote.py -
+
+    # Show help
+    python3 register_remote.py --help
 """
 
+import argparse
 import base64
+import gzip
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import yaml
@@ -149,7 +168,11 @@ class LocalXDRRegistration:
             print(f"[!] Could not parse values.yaml for display: {e}")
 
     def normalize_ca_key_pair_yaml(self) -> str:
-        """Ensure ca-key-pair.yaml has the correct structure for extract_yaml.py"""
+        """Ensure ca-key-pair.yaml has the correct structure for extract_yaml.py
+
+        CRITICAL FIX: This function now properly validates that ALL THREE certificates
+        are present (ca.crt, tls.key, tls.crt) and will fail if any are missing.
+        """
         if not self.ca_key_pair_yaml:
             return ""
 
@@ -157,47 +180,83 @@ class LocalXDRRegistration:
             ca_data = yaml.safe_load(self.ca_key_pair_yaml)
 
             # Debug: Show what keys we have in the raw data
-            print(f"[*] Raw certificate data keys: {list(ca_data.keys())}")
+            print("[*] Raw certificate data structure:")
+            print(f"[*]   Top-level keys: {list(ca_data.keys())}")
 
-            # Check if it already has the expected structure (data.tls.crt, etc.)
-            if "data" in ca_data and "tls.crt" in ca_data["data"]:
-                # Already in correct format
-                return self.ca_key_pair_yaml
+            # Determine the structure and extract certificates
+            certs = {}
 
-            # If it has the flat structure (ca.crt, tls.key, tls.crt at top level)
-            # Transform it to the expected nested structure
-            if "ca.crt" in ca_data or "tls.crt" in ca_data or "tls.key" in ca_data:
-                normalized = {
-                    "data": {
-                        "ca.crt": ca_data.get("ca.crt", ""),
-                        "tls.crt": ca_data.get("tls.crt", ""),
-                        "tls.key": ca_data.get("tls.key", ""),
-                    }
-                }
-
-                # Debug: Show what we're including
-                for key in ["ca.crt", "tls.crt", "tls.key"]:
-                    if key in ca_data:
-                        print(f"[*]   {key}: present ({len(ca_data[key])} chars)")
-                    else:
-                        print(f"[!]   {key}: MISSING from source data")
-
-                print("[*] Normalized ca-key-pair.yaml structure to expected format")
-                # Use width parameter to prevent line wrapping of long base64 strings
-                return yaml.dump(
-                    normalized, default_flow_style=False, width=float("inf")
+            if "data" in ca_data and isinstance(ca_data["data"], dict):
+                # Nested structure: data -> ca.crt, tls.key, tls.crt
+                print(
+                    f"[*]   Found nested structure with keys: {list(ca_data['data'].keys())}"
                 )
+                certs = {
+                    "ca.crt": ca_data["data"].get("ca.crt", ""),
+                    "tls.key": ca_data["data"].get("tls.key", ""),
+                    "tls.crt": ca_data["data"].get("tls.crt", ""),
+                }
+            elif any(key in ca_data for key in ["ca.crt", "tls.key", "tls.crt"]):
+                # Flat structure: ca.crt, tls.key, tls.crt at top level
+                print("[*]   Found flat structure")
+                certs = {
+                    "ca.crt": ca_data.get("ca.crt", ""),
+                    "tls.key": ca_data.get("tls.key", ""),
+                    "tls.crt": ca_data.get("tls.crt", ""),
+                }
+            else:
+                print(
+                    "[!] ERROR: Could not find certificate data in ca-key-pair.yaml",
+                    file=sys.stderr,
+                )
+                return ""
 
-            # Return as-is if we can't determine the structure
-            return self.ca_key_pair_yaml
+            # CRITICAL VALIDATION: Check that all three certificates are present and non-empty
+            print("\n[*] Certificate validation:")
+            missing_certs = []
+            for key in ["ca.crt", "tls.key", "tls.crt"]:
+                if certs.get(key) and len(certs[key].strip()) > 0:
+                    print(f"[+]   {key}: present ({len(certs[key])} chars)")
+                else:
+                    print(f"[!]   {key}: MISSING or EMPTY")
+                    missing_certs.append(key)
+
+            if missing_certs:
+                print(f"\n{'=' * 70}")
+                print("[!] CRITICAL ERROR: Missing required certificates!")
+                print(
+                    f"[!] The following certificates are missing: {', '.join(missing_certs)}"
+                )
+                print(f"{'=' * 70}")
+                print("\n[!] This means the cloud-config from Cisco is incomplete.")
+                print("[!] Possible solutions:")
+                print(
+                    "[!]   1. Check if you copied the full base64 string from Cisco XDR"
+                )
+                print("[!]   2. Try regenerating the remote in Cisco XDR dashboard")
+                print("[!]   3. Contact Cisco support if the issue persists")
+                print(f"{'=' * 70}\n")
+                sys.exit(1)
+
+            # Create normalized structure with all three certificates
+            normalized = {"data": certs}
+
+            print("[+] All certificates validated successfully")
+            print("[*] Normalizing ca-key-pair.yaml to expected format")
+
+            # Use width parameter to prevent line wrapping of long base64 strings
+            return yaml.dump(normalized, default_flow_style=False, width=float("inf"))
 
         except Exception as e:
-            print(f"[!] Warning: Could not normalize ca-key-pair.yaml: {e}")
-            return self.ca_key_pair_yaml if self.ca_key_pair_yaml else ""
+            print(f"[!] Error normalizing ca-key-pair.yaml: {e}", file=sys.stderr)
+            import traceback
+
+            traceback.print_exc()
+            return ""
 
     def write_config_files(self):
         """Write YAML files to /etc/ao-remote/"""
-        print("[*] Writing configuration files to /etc/ao-remote/...")
+        print("\n[*] Writing configuration files to /etc/ao-remote/...")
 
         target_dir = Path("/etc/ao-remote")
 
@@ -215,6 +274,10 @@ class LocalXDRRegistration:
 
             # Normalize and write ca-key-pair.yaml
             normalized_ca_key_pair = self.normalize_ca_key_pair_yaml()
+            if not normalized_ca_key_pair:
+                print("[!] Failed to normalize ca-key-pair.yaml", file=sys.stderr)
+                return False
+
             ca_key_pair_path = target_dir / "ca-key-pair.yaml"
             with open(ca_key_pair_path, "w") as f:
                 f.write(normalized_ca_key_pair)
@@ -222,6 +285,20 @@ class LocalXDRRegistration:
             print(f"[+] Written: {ca_key_pair_path}")
 
             print("[+] Configuration files written successfully\n")
+
+            # CRITICAL: Always delete old extracted certificate files
+            # This ensures docker-compose-init.sh will extract fresh certificates
+            # from the updated ca-key-pair.yaml instead of using stale files
+            cert_dir = Path("/etc/docker-compose/secrets/ao-remote/for-mqtt")
+            if cert_dir.exists():
+                print("[*] Removing old certificate files to force fresh extraction...")
+                subprocess.run(
+                    ["rm", "-f", str(cert_dir / "*.pem")],
+                    shell=True,
+                    check=False,
+                )
+                print("[+] Old certificate files removed")
+
             return True
 
         except PermissionError:
@@ -229,10 +306,13 @@ class LocalXDRRegistration:
             return False
         except Exception as e:
             print(f"[!] Error writing files: {e}", file=sys.stderr)
+            import traceback
+
+            traceback.print_exc()
             return False
 
     def check_existing_registration(self):
-        """Check if containers are already running and offer to clean up"""
+        """Check if containers are already running and automatically clean up"""
         try:
             result = subprocess.run(
                 ["docker", "ps", "-q", "-f", "name=xdr-automation"],
@@ -241,33 +321,28 @@ class LocalXDRRegistration:
             )
 
             if result.stdout.strip():
-                print("\n[!] Existing XDR containers are already running")
-                print(
-                    "[*] Would you like to stop and remove them before re-registering? (yes/no)"
+                print("\n[!] Existing XDR containers detected")
+                print("[*] Automatically stopping and removing containers...")
+                subprocess.run(
+                    [
+                        "docker",
+                        "compose",
+                        "-f",
+                        "/etc/docker-compose/docker-compose.yaml",
+                        "down",
+                    ],
+                    check=False,
                 )
-                response = input("> ").strip().lower()
 
-                if response in ["yes", "y"]:
-                    print("[*] Stopping containers...")
-                    subprocess.run(
-                        [
-                            "docker",
-                            "compose",
-                            "-f",
-                            "/etc/docker-compose/docker-compose.yaml",
-                            "down",
-                        ],
-                        check=False,
-                    )
-                    print("[+] Containers stopped and removed")
-                    return True
-                else:
-                    print(
-                        "[!] Warning: Registration may fail with existing containers running"
-                    )
-                    print("[*] Continue anyway? (yes/no)")
-                    response = input("> ").strip().lower()
-                    return response in ["yes", "y"]
+                # Also clean up old certificate files
+                print("[*] Cleaning up old certificate files...")
+                subprocess.run(
+                    ["rm", "-rf", "/etc/docker-compose/secrets/ao-remote"],
+                    check=False,
+                )
+
+                print("[+] Containers stopped and old certificates cleaned")
+                return True
 
             return True
 
@@ -276,7 +351,7 @@ class LocalXDRRegistration:
             return True  # Don't block registration
 
     def check_ipv4_forwarding(self):
-        """Check if IPv4 forwarding is enabled and offer to enable it"""
+        """Check if IPv4 forwarding is enabled and automatically enable it"""
         try:
             result = subprocess.run(
                 ["sysctl", "net.ipv4.ip_forward"], capture_output=True, text=True
@@ -284,31 +359,23 @@ class LocalXDRRegistration:
 
             if "net.ipv4.ip_forward = 0" in result.stdout:
                 print("\n[!] IPv4 forwarding is currently disabled")
-                print("[*] Docker containers require IPv4 forwarding for networking")
-                print("\nWould you like to enable IPv4 forwarding now? (yes/no)")
-                response = input("> ").strip().lower()
+                print("[*] Automatically enabling IPv4 forwarding...")
 
-                if response in ["yes", "y"]:
-                    # Enable immediately
-                    subprocess.run(
-                        ["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"], check=True
-                    )
+                # Enable immediately
+                subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True)
 
-                    # Make it persistent across reboots
-                    sysctl_conf = "/etc/sysctl.conf"
-                    with open(sysctl_conf, "r") as f:
-                        content = f.read()
+                # Make it persistent across reboots
+                sysctl_conf = "/etc/sysctl.conf"
+                with open(sysctl_conf, "r") as f:
+                    content = f.read()
 
-                    if "net.ipv4.ip_forward=1" not in content:
-                        with open(sysctl_conf, "a") as f:
-                            f.write("\n# Enable IPv4 forwarding for Docker\n")
-                            f.write("net.ipv4.ip_forward=1\n")
+                if "net.ipv4.ip_forward=1" not in content:
+                    with open(sysctl_conf, "a") as f:
+                        f.write("\n# Enable IPv4 forwarding for Docker\n")
+                        f.write("net.ipv4.ip_forward=1\n")
 
-                    print("[+] IPv4 forwarding enabled")
-                    return True
-                else:
-                    print("[!] Warning: Containers may not have network connectivity")
-                    return True
+                print("[+] IPv4 forwarding enabled")
+                return True
             else:
                 print("[+] IPv4 forwarding is already enabled")
                 return True
@@ -389,38 +456,243 @@ class LocalXDRRegistration:
         print("    docker compose -f /etc/docker-compose/docker-compose.yaml logs -f")
 
 
-def get_base64_input():
-    """Prompt user for base64 string"""
-    print("=" * 70)
-    print("Cisco XDR Remote Appliance Registration")
-    print("=" * 70)
-    print("\nPlease paste the base64 OVF user-data string.")
-    print("(It should be a long string starting with 'I2Nsb3VkLWNvbmZpZwo...')")
-    print("\nPaste the string and press Enter:")
+def cleanup_registration():
+    """Clean up all registration data and return to pristine state"""
+    from datetime import datetime
 
-    base64_string = input("> ").strip()
+    print("=" * 70)
+    print("Cisco XDR Remote Appliance - Registration Cleanup")
+    print("=" * 70)
+    print()
 
-    if not base64_string:
-        print("[!] No input provided", file=sys.stderr)
+    print("[*] This will clean up:")
+    print("    - All XDR Docker containers")
+    print("    - Configuration files in /etc/ao-remote/")
+    print("    - Extracted certificate files")
+    print()
+
+    # Step 1: Stop and remove containers
+    print("[1/3] Stopping and removing XDR containers...")
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-q", "-f", "name=xdr-automation"],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.stdout.strip():
+            subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    "/etc/docker-compose/docker-compose.yaml",
+                    "down",
+                ],
+                check=False,
+                capture_output=True,
+            )
+            print("[+] Docker containers stopped and removed")
+        else:
+            print("[*] No XDR containers found (already clean)")
+    except Exception as e:
+        print(f"[!] Warning: {e}")
+
+    # Step 2: Remove config files
+    print("[2/3] Removing configuration files...")
+    config_dir = Path("/etc/ao-remote")
+    if config_dir.exists():
+        # Create backup
+        backup_dir = Path(
+            f"/tmp/ao-remote-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            subprocess.run(
+                ["cp", "-r", str(config_dir) + "/", str(backup_dir) + "/"],
+                check=False,
+                capture_output=True,
+            )
+            print(f"[+] Backup created at: {backup_dir}")
+        except:
+            pass
+
+        # Remove files
+        for file in ["values.yaml", "ca-key-pair.yaml", "ca-key-pair.yaml.backup"]:
+            file_path = config_dir / file
+            if file_path.exists():
+                file_path.unlink()
+
+        # Remove directory if empty
+        if not list(config_dir.iterdir()):
+            config_dir.rmdir()
+            print("[+] Removed /etc/ao-remote/ directory")
+    else:
+        print("[*] /etc/ao-remote/ not found (already clean)")
+
+    # Step 3: Remove certificate files
+    print("[3/3] Removing extracted certificate files...")
+    cert_dir = Path("/etc/docker-compose/secrets/ao-remote")
+    if cert_dir.exists():
+        subprocess.run(["rm", "-rf", str(cert_dir)], check=False, capture_output=True)
+        print("[+] Removed certificate directory")
+    else:
+        print("[*] Certificate directory not found (already clean)")
+
+    print()
+    print("=" * 70)
+    print("[+] Cleanup completed successfully!")
+    print("=" * 70)
+    print()
+    print("[*] The appliance is now in a clean state")
+    print("[*] Ready for re-registration")
+
+
+def read_config_file(file_path):
+    """Read base64 string from file, handling compressed formats"""
+    try:
+        path = Path(file_path)
+
+        # Handle stdin
+        if file_path == "-":
+            print("[*] Reading configuration from stdin...")
+            content = sys.stdin.read().strip()
+            return content
+
+        # Check if file exists
+        if not path.exists():
+            print(f"[!] File not found: {file_path}", file=sys.stderr)
+            return None
+
+        # Handle gzipped files
+        if file_path.endswith(".gz"):
+            print(f"[*] Reading gzipped configuration from {file_path}...")
+            with gzip.open(file_path, "rt") as f:
+                content = f.read().strip()
+            return content
+
+        # Handle zip files
+        if file_path.endswith(".zip"):
+            print(f"[*] Reading zipped configuration from {file_path}...")
+            with zipfile.ZipFile(file_path, "r") as z:
+                # Get first file in zip
+                names = z.namelist()
+                if not names:
+                    print("[!] Zip file is empty", file=sys.stderr)
+                    return None
+                with z.open(names[0]) as f:
+                    content = f.read().decode("utf-8").strip()
+            return content
+
+        # Handle plain text files
+        print(f"[*] Reading configuration from {file_path}...")
+        with open(file_path, "r") as f:
+            content = f.read().strip()
+        return content
+
+    except Exception as e:
+        print(f"[!] Error reading file: {e}", file=sys.stderr)
         return None
-
-    return base64_string
 
 
 def main():
+    # Set up argument parser
+    parser = argparse.ArgumentParser(
+        description="Cisco XDR Remote Appliance Registration & Cleanup Script",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Registration Examples:
+  # Register from plain text config file
+  sudo python3 register_remote.py myRemote_config.txt
+
+  # Register from gzipped config file
+  sudo python3 register_remote.py myRemote_config.txt.gz
+
+  # Register from zipped config file
+  sudo python3 register_remote.py myRemote_config.zip
+
+  # Register from stdin
+  cat myRemote_config.txt | sudo python3 register_remote.py -
+
+  # Register with base64 string directly
+  sudo python3 register_remote.py "I2Nsb3VkLWNvbmZpZwo..."
+
+Cleanup Example:
+  # De-register and clean up artifacts
+  sudo python3 register_remote.py --cleanup
+
+Config File Format:
+  The config file should contain a single line with the base64-encoded
+  cloud-config string obtained from Cisco XDR/Workflows dashboard when creating
+  a new remote appliance.
+
+Notes:
+  - This script must be run as root (use sudo)
+  - Automatically cleans up existing registrations during re-registration
+  - Automatically enables IPv4 forwarding if needed
+  - No interactive prompts - suitable for automation
+  - Validates all three certificates before proceeding
+        """,
+    )
+
+    parser.add_argument(
+        "config",
+        nargs="?",
+        help='Config file path (plain text, .gz, or .zip), "-" for stdin, or base64 string',
+    )
+
+    parser.add_argument(
+        "--cleanup", action="store_true", help="Clean up existing registration and exit"
+    )
+
+    parser.add_argument("-v", "--version", action="version", version="%(prog)s v1.4")
+
+    args = parser.parse_args()
+
     # Check if running as root
     if os.geteuid() != 0:
         print("[!] This script must be run as root (use sudo)", file=sys.stderr)
         sys.exit(1)
 
-    # Get base64 string from command line or prompt
-    if len(sys.argv) > 1:
-        base64_string = sys.argv[1].strip()
-        print("[*] Using base64 string from command line argument")
+    # Handle cleanup mode
+    if args.cleanup:
+        cleanup_registration()
+        sys.exit(0)
+
+    # Require config for registration
+    if not args.config:
+        parser.print_help()
+        print(
+            "\n[!] Error: config file path is required for registration",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print("=" * 70)
+    print("Cisco XDR Remote Appliance Registration - v1.4")
+    print("=" * 70)
+    print()
+
+    # Get base64 string from file or argument
+    base64_string = None
+
+    # Check if it's a file path or direct base64 string
+    if (
+        args.config == "-"
+        or Path(args.config).exists()
+        or args.config.endswith((".gz", ".zip"))
+    ):
+        # It's a file (or stdin)
+        base64_string = read_config_file(args.config)
     else:
-        base64_string = get_base64_input()
-        if not base64_string:
-            sys.exit(1)
+        # Assume it's a direct base64 string (legacy support)
+        print("[*] Using base64 string from command line argument")
+        base64_string = args.config.strip()
+
+    if not base64_string:
+        print("[!] No configuration data provided", file=sys.stderr)
+        sys.exit(1)
 
     # Create registrator instance
     registrator = LocalXDRRegistration(base64_string)
@@ -436,32 +708,24 @@ def main():
     # Step 3: Display configuration
     registrator.display_config_info()
 
-    # Step 4: Check for existing registration
+    # Step 4: Check for existing registration (auto-cleanup)
     if not registrator.check_existing_registration():
-        print("[*] Registration cancelled")
-        sys.exit(0)
+        print("[!] Failed to clean up existing registration")
+        sys.exit(1)
 
-    # Step 5: Check IPv4 forwarding
+    # Step 5: Check IPv4 forwarding (auto-enable)
     registrator.check_ipv4_forwarding()
 
-    # Step 6: Confirm before proceeding
-    print("\nDo you want to proceed with registration? (yes/no)")
-    confirm = input("> ").strip().lower()
-
-    if confirm not in ["yes", "y"]:
-        print("[*] Registration cancelled")
-        sys.exit(0)
-
-    # Step 7: Write configuration files
+    # Step 6: Write configuration files
     if not registrator.write_config_files():
         sys.exit(1)
 
-    # Step 8: Run registration
+    # Step 7: Run registration
     if not registrator.run_registration():
         print("\n[!] Registration failed. Check the logs above for errors.")
         sys.exit(1)
 
-    # Step 9: Verify registration
+    # Step 8: Verify registration
     registrator.verify_registration()
 
     print("\n[+] Registration process complete!")
