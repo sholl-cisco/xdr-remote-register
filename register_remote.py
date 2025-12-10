@@ -27,7 +27,7 @@ Features:
 - Normalizes YAML structure for compatibility
 - Detects existing registrations and automatically cleans up
 
-v1.4 Changes:
+v1.1 Changes:
 - REMOVED all interactive prompts - input prompt with pasted text often dropped characters
 causing data parsing issues
 - ADDED support for zipped config files (.gz, .zip)
