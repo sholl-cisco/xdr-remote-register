@@ -6,6 +6,6 @@ Enhancements to the deployment model for the remote server will be coming offici
 
 ## Installation
 1. Download the OVA for a remote server from your XDR / Workflows tenant and download your `remotePackage.zip` for your configured remote server.
-2. Run `stage_ova.py` to convert the OVA to a qcow disk image, change the password, and push the register_remote.py script to it.
+2. Run `stage_ova.py <cisco-automation-remote.ova>` to convert the OVA to a qcow disk image, change the password, and push the register_remote.py script to it.
 3. SCP the 
 4. Run `register_remote.py remotePackage.zip` on the remote appliance.
