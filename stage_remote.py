@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
 Cisco XDR Remote Appliance - OVA to QCOW2 Converter
-v1.0 - 15-Jan-2026
+v1.2 - 15-Jan-2026
 Author: Steve Holl [sholl@cisco.com]
 
-This script converts a Cisco XDR Remote Appliance OVA to a customized QCOW2 image. 
-This is not an officially supported process, and not supported by Cisco / TAC.
-Only use for internal testing and lab purposes, and not production networks.
+This script converts a Cisco XDR Remote Appliance OVA to a customized QCOW2 image.
 
 Features:
 - Extracts VMDK from OVA archive
@@ -14,6 +12,8 @@ Features:
 - Downloads register_remote.py from GitHub
 - Sets root password to 'cisco' with forced change on first login
 - Places registration script at /root/register_remote.py
+- Configures netplan for DHCP on any ethernet interface (works across hypervisors)
+- Enables SSH service with root login permitted
 
 Requirements:
 - qemu-img (brew install qemu)
@@ -42,6 +42,18 @@ GITHUB_SCRIPT_URL = "https://raw.githubusercontent.com/sholl-cisco/xdr-remote-re
 
 # Docker image for libguestfs
 DOCKER_IMAGE = "fedora:39"
+
+# Netplan config that works across all hypervisors (UTM, VMware, KVM, VirtualBox)
+NETPLAN_CONFIG = """# Auto-generated netplan config for cross-hypervisor compatibility
+# Matches any ethernet interface (enp0s1, ens160, ens3, etc.)
+network:
+  version: 2
+  ethernets:
+    all-eth:
+      match:
+        name: "en*"
+      dhcp4: true
+"""
 
 
 def install_requests():
@@ -146,12 +158,14 @@ def download_script(requests_module, output_path):
         return False
 
 
-def customize_image(qcow2_path, script_path):
+def customize_image(qcow2_path, script_path, work_dir):
     """Customize QCOW2 image with Docker + libguestfs"""
     print("[*] Customizing QCOW2 image...")
     print("    - Setting root password to 'cisco'")
     print("    - Forcing password change on first login")
     print("    - Installing register_remote.py to /root/")
+    print("    - Configuring netplan for cross-hypervisor DHCP")
+    print("    - Enabling SSH with root login")
 
     # Get absolute paths for Docker volume mount
     qcow2_abs = os.path.abspath(qcow2_path)
@@ -162,6 +176,11 @@ def customize_image(qcow2_path, script_path):
     script_in_workdir = os.path.join(work_dir, "register_remote.py")
     if script_abs != script_in_workdir:
         shutil.copy(script_abs, script_in_workdir)
+
+    # Write netplan config to work directory
+    netplan_path = os.path.join(work_dir, "99-dhcp-all.yaml")
+    with open(netplan_path, 'w') as f:
+        f.write(NETPLAN_CONFIG)
 
     qcow2_name = os.path.basename(qcow2_abs)
 
@@ -179,8 +198,16 @@ def customize_image(qcow2_path, script_path):
         f"-a /work/{qcow2_name} "
         f"--copy-in /work/register_remote.py:/root/ "
         f"--chmod 0755:/root/register_remote.py "
+        f"--copy-in /work/99-dhcp-all.yaml:/etc/netplan/ "
+        f"--chmod 0644:/etc/netplan/99-dhcp-all.yaml "
         f"--root-password password:cisco "
-        f"--run-command 'chage -d 0 root'"
+        f"--run-command 'chage -d 0 root' "
+        f"--run-command 'systemctl enable ssh' "
+        f"--run-command \"sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config\" "
+        f"--run-command \"grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config\" "
+        f"--run-command \"sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config\" "
+        f"--run-command \"grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config\" "
+        f"--run-command \"rm -f /etc/ssh/sshd_config.d/*cloud* 2>/dev/null; sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true\""
     ]
 
     print("[*] Running Docker + libguestfs (this may take a few minutes)...")
@@ -190,6 +217,10 @@ def customize_image(qcow2_path, script_path):
         capture_output=True,
         text=True
     )
+
+    # Cleanup temp files
+    if os.path.exists(netplan_path):
+        os.unlink(netplan_path)
 
     if result.returncode != 0:
         print("[!] ERROR: Image customization failed", file=sys.stderr)
@@ -228,6 +259,7 @@ Examples:
 The output QCOW2 will have:
     - Root password: cisco (forced change on first login)
     - /root/register_remote.py installed and executable
+    - Netplan configured for DHCP on any ethernet interface
         """
     )
     parser.add_argument("ova_file", help="Input OVA file")
@@ -283,7 +315,7 @@ The output QCOW2 will have:
         sys.exit(1)
 
     # Step 4: Customize image
-    if not customize_image(qcow2_full_path, script_path):
+    if not customize_image(qcow2_full_path, script_path, work_dir):
         os.unlink(script_path)
         sys.exit(1)
 
@@ -302,6 +334,8 @@ The output QCOW2 will have:
     print("  - Root password:          cisco")
     print("  - Password change:        Required on first login")
     print("  - Registration script:    /root/register_remote.py")
+    print("  - Network:                DHCP on any en* interface")
+    print("  - SSH:                    Enabled with root login")
     print("=" * 70)
 
 
