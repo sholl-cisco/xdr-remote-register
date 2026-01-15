@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Cisco XDR/Workflows Remote Appliance Local Registration Script
-v1.2 - 07-Jan-2026
+v1.3 - 15-Jan-2026
 Author: Steve Holl [sholl@cisco.com]
 
 This script registers a Cisco XDR/Workflows Remote Appliance by:
@@ -11,7 +11,7 @@ This script registers a Cisco XDR/Workflows Remote Appliance by:
 4. Checking IPv4 forwarding and offering to enable it
 5. Writing configuration files to /etc/ao-remote/
 6. Running the docker-compose-init.sh script
-7. Verifying registration
+7. Verifying registration with MQTT heartbeat confirmation
 
 Features:
 - Handles base64 padding issues automatically
@@ -22,17 +22,17 @@ Features:
 - Fully repeatable for lab environments without needing
   the user encoded-data into the OVF, which some virtualization
   environments don't support
-- Verifies registration before claiming success (v1.2)
+- Verifies MQTT heartbeat via syslog before claiming success (v1.2)
 - Detects container restart loops and provides diagnostics (v1.2)
 - Works with syslog logging driver (reads from journalctl/syslog) (v1.2)
+- Cleans old certificates on re-registration to prevent stale credential issues (v1.3)
 
 Usage (run directly on the appliance):
-    sudo python3 register-local.py <remotePackage.zip>
-
-Can also provide input interactively or by pasting the string in directly,
- but this isn't recommended in case characters drop it can corrupt certificates:
     sudo python3 register-local.py
+
+Or non-interactive:
     sudo python3 register-local.py <base64_string>
+    sudo python3 register-local.py remotePackage.zip
 """
 
 import argparse
@@ -270,6 +270,17 @@ class LocalXDRRegistration:
                         check=False,
                     )
                     print("[+] Containers stopped and removed")
+
+                    # Remove old certificates to force regeneration with new credentials
+                    secrets_dir = Path("/etc/docker-compose/secrets")
+                    if secrets_dir.exists():
+                        print("[*] Removing old certificates to force regeneration...")
+                        try:
+                            shutil.rmtree(secrets_dir)
+                            print("[+] Old certificates removed")
+                        except Exception as e:
+                            print(f"[!] Warning: Could not remove old certificates: {e}")
+
                     return True
                 else:
                     print(
@@ -543,6 +554,20 @@ class LocalXDRRegistration:
             return bool(result.stdout.strip())
         except Exception:
             return False
+
+    def clean_old_certificates(self):
+        """Remove old certificates to force regeneration with new credentials"""
+        secrets_dir = Path("/etc/docker-compose/secrets")
+        if secrets_dir.exists():
+            print("[*] Removing old certificates to force regeneration...")
+            try:
+                shutil.rmtree(secrets_dir)
+                print("[+] Old certificates removed")
+                return True
+            except Exception as e:
+                print(f"[!] Warning: Could not remove old certificates: {e}")
+                return False
+        return True
 
     def run_registration(self):
         """Run the docker-compose-init.sh script"""
@@ -859,7 +884,10 @@ def main():
         print("[*] Registration cancelled")
         sys.exit(0)
 
-    # Step 7: Write configuration files
+    # Step 7: Clean old certificates (forces regeneration with new credentials)
+    registrator.clean_old_certificates()
+
+    # Step 8: Write configuration files
     if not registrator.write_config_files():
         sys.exit(1)
 
